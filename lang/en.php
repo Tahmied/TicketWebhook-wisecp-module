@@ -2,12 +2,13 @@
 return [
     'meta' => [
         'name' => 'Ticket Webhook',
-        'description' => 'Sends every new support ticket to an external API.',
+        'description' => 'Posts new support tickets and replies to Slack, one thread per ticket.',
     ],
-    'url' => 'Slack Webhook URL',
-    'secret' => 'Signing secret (optional)',
-    'timeout' => 'Timeout in seconds (1-10)',
-    'err-url' => 'Endpoint URL must start with https://',
+    'token' => 'Slack Bot Token (xoxb-...)',
+    'channel' => 'Slack Channel ID',
     'company' => 'Company Name',
+    'timeout' => 'Timeout in seconds (1-10)',
+    'err-token' => 'Bot token must start with xoxb-',
+    'err-channel' => 'Channel ID looks like C0123456789 (not the channel name).',
     'err-company' => 'Company name is required.',
 ];

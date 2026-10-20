@@ -6,25 +6,37 @@ use Exception;
 
 class TicketWebhook extends AddonModule
 {
-    public string $version = '1.0';
+    public string $version = '1.1';
 
     // Admin links: the id is appended to the end.
     private const CLIENT_URL = 'https://app.ogahost.com/ishquj/users/detail?id=';
     private const TICKET_URL = 'https://app.ogahost.com/ishquj/tickets/detail?id=';
 
+    // ticket_id -> Slack thread (channel + ts of the parent message)
+    private const TABLE = 'ticketwebhook_threads';
+
     // Keys: 'new:{ticketId}' and 'reply:{replyId}', per request.
     private static array $sent = [];
+    private static bool $tableReady = false;
+
+    // ---------------------------------------------------------------- settings
 
     public function fields(): array
     {
         $s = $this->config['settings'] ?? [];
 
         return [
-            'url' => [
-                'name' => $this->lang['url'],
+            'token' => [
+                'name' => $this->lang['token'],
                 'type' => 'password',
                 'wrap_width' => 100,
-                'value' => ($s['url'] ?? '') !== '' ? '********' : '',
+                'value' => ($s['token'] ?? '') !== '' ? '********' : '',
+            ],
+            'channel' => [
+                'name' => $this->lang['channel'],
+                'type' => 'text',
+                'wrap_width' => 100,
+                'value' => $s['channel'] ?? '',
             ],
             'company' => [
                 'name' => $this->lang['company'],
@@ -43,17 +55,22 @@ class TicketWebhook extends AddonModule
 
     public function save_fields($fields = []): array|bool
     {
-        $url = trim((string) ($fields['url'] ?? ''));
+        $token = trim((string) ($fields['token'] ?? ''));
 
-        if ($url === '********') {
+        if ($token === '********') {
             // Mask means "unchanged": keep the stored (encrypted) value.
-            $fields['url'] = $this->config['settings']['url'] ?? '';
+            $fields['token'] = $this->config['settings']['token'] ?? '';
         } else {
-            if (!preg_match('#^https://#i', $url))
-                throw new Exception($this->lang['err-url']);
+            if (!preg_match('#^xoxb-#', $token))
+                throw new Exception($this->lang['err-token']);
 
-            $fields['url'] = $this->encode_str($url);
+            $fields['token'] = $this->encode_str($token);
         }
+
+        $channel = trim((string) ($fields['channel'] ?? ''));
+        if (!preg_match('#^[CG][A-Z0-9]{8,}$#', $channel))
+            throw new Exception($this->lang['err-channel']);
+        $fields['channel'] = $channel;
 
         $company = trim((string) ($fields['company'] ?? ''));
         if ($company === '')
@@ -65,7 +82,17 @@ class TicketWebhook extends AddonModule
         return $fields;
     }
 
-    // New ticket (customer, email, chat, or staff).
+    public function enable(): bool
+    {
+        if (!$this->ensure_table())
+            throw new Exception('Table could not be created: ' . \WDB::getErrorMessage());
+
+        return true;
+    }
+
+    // ---------------------------------------------------------------- senders
+
+    // New ticket (customer, email, chat, or staff): becomes the thread parent.
     public function send_ticket(string $source, $ticket, string $message, int $clientId, int $replyId = 0): void
     {
         if (!is_array($ticket))
@@ -91,7 +118,9 @@ class TicketWebhook extends AddonModule
         if ($body !== '')
             $text .= "\nMessage: {$body}";
 
-        $this->post_slack($text, "ticket #{$ticketId}");
+        $res = $this->slack_post($text, '', "ticket #{$ticketId}");
+        if ($res['ok'])
+            $this->thread_save($ticketId, $res['ts'], $res['channel']);
     }
 
     // Reply on an existing ticket. $from is 'client' or 'staff'.
@@ -114,60 +143,167 @@ class TicketWebhook extends AddonModule
         }
 
         $company = $this->company();
-        $title = $this->slack_escape(trim((string) ($ticket['title'] ?? '')));
         $body = $this->slack_body($message);
         if ($body === '')
             $body = '(no text)';
 
         $label = $from === 'staff' ? "{$company} Team" : 'Client';
+        $line = "{$label}: {$body}";
+
+        // 1) Known thread: post the short line inside it.
+        $thread = $this->thread_find($ticketId);
+        if ($thread) {
+            $res = $this->slack_post($line, $thread['slack_ts'], "ticket #{$ticketId} reply", $thread['channel']);
+            if ($res['ok'] || $res['error'] !== 'thread_not_found')
+                return;
+            // Parent message is gone: fall through and start a fresh thread.
+        }
+
+        // 2) No thread yet (ticket predates threading, or parent lost): start one with context.
+        $title = $this->slack_escape(trim((string) ($ticket['title'] ?? '')));
 
         $text = "{$company} ticket reply";
         if ($title !== '')
             $text .= "\nTitle: {$title}";
         $text .= "\nTicket: " . self::TICKET_URL . $ticketId;
-        $text .= "\n{$label}: {$body}";
+        $text .= "\n{$line}";
 
-        $this->post_slack($text, "ticket #{$ticketId} reply");
+        $res = $this->slack_post($text, '', "ticket #{$ticketId} reply");
+        if ($res['ok'])
+            $this->thread_save($ticketId, $res['ts'], $res['channel']);
     }
 
-    private function post_slack(string $text, string $label): void
-    {
-        $s = $this->config['settings'] ?? [];
-        $url = $this->decode_str((string) ($s['url'] ?? ''));
-        if ($url === '')
-            return;
+    // ---------------------------------------------------------------- Slack
 
-        $payload = json_encode(
-            ['text' => $text],
-            JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
-        );
+    // chat.postMessage. Returns ['ok', 'ts', 'channel', 'error'].
+    private function slack_post(string $text, string $threadTs, string $label, string $channel = ''): array
+    {
+        $fail = ['ok' => false, 'ts' => '', 'channel' => '', 'error' => ''];
+
+        $s = $this->config['settings'] ?? [];
+        $token = $this->decode_str((string) ($s['token'] ?? ''));
+        $channel = $channel !== '' ? $channel : trim((string) ($s['channel'] ?? ''));
+
+        if ($token === '' || $channel === '') {
+            $fail['error'] = 'not_configured';
+            error_log("[TicketWebhook] {$label}: Slack bot token / channel not configured");
+            return $fail;
+        }
+
+        $data = ['channel' => $channel, 'text' => $text];
+        if ($threadTs !== '')
+            $data['thread_ts'] = $threadTs;
+
+        $payload = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         if ($payload === false) {
+            $fail['error'] = 'encode_failed';
             error_log("[TicketWebhook] {$label}: could not encode payload");
-            return;
+            return $fail;
         }
 
         try {
-            $ch = curl_init($url);
+            $ch = curl_init('https://slack.com/api/chat.postMessage');
             curl_setopt_array($ch, [
                 CURLOPT_POST => true,
                 CURLOPT_POSTFIELDS => $payload,
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/json; charset=utf-8',
+                    'Authorization: Bearer ' . $token,
+                ],
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_CONNECTTIMEOUT => 2,
                 CURLOPT_TIMEOUT => (int) ($s['timeout'] ?? 3),
             ]);
-            $resp = curl_exec($ch);
+            $raw = curl_exec($ch);
             $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $err = curl_error($ch);
             curl_close($ch);
 
-            // Slack answers 200 with the body "ok" on success.
-            if ($err !== '' || $code !== 200)
-                error_log("[TicketWebhook] {$label} failed: HTTP {$code} {$err} " . (is_string($resp) ? $resp : ''));
+            $json = is_string($raw) ? json_decode($raw, true) : null;
+
+            if ($err !== '' || !is_array($json) || empty($json['ok'])) {
+                // Slack error codes: invalid_auth, channel_not_found, not_in_channel, thread_not_found ...
+                $fail['error'] = (string) ($json['error'] ?? ($err !== '' ? $err : "http_{$code}"));
+                error_log("[TicketWebhook] {$label} failed: {$fail['error']} (HTTP {$code})");
+                return $fail;
+            }
+
+            return [
+                'ok' => true,
+                'ts' => (string) ($json['ts'] ?? ''),
+                'channel' => (string) ($json['channel'] ?? $channel),
+                'error' => '',
+            ];
         } catch (\Throwable $e) {
+            $fail['error'] = 'exception';
             error_log("[TicketWebhook] {$label} exception: " . $e->getMessage());
+            return $fail;
         }
     }
+
+    // ---------------------------------------------------------------- thread storage
+
+    private function ensure_table(): bool
+    {
+        if (self::$tableReady)
+            return true;
+
+        if (!\WDB::hasTable(self::TABLE)) {
+            \WDB::exec('CREATE TABLE `' . self::TABLE . '` (
+                `ticket_id` INT UNSIGNED NOT NULL,
+                `channel`   VARCHAR(32)  NOT NULL DEFAULT "",
+                `slack_ts`  VARCHAR(32)  NOT NULL DEFAULT "",
+                `cdate`     DATETIME     NOT NULL,
+                PRIMARY KEY (`ticket_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+        }
+
+        // exec() swallows errors, so read the result back.
+        return self::$tableReady = \WDB::hasTable(self::TABLE);
+    }
+
+    private function thread_find(int $ticketId): ?array
+    {
+        if (!$this->ensure_table())
+            return null;
+
+        try {
+            $stmt = \WDB::select('channel, slack_ts')->from(self::TABLE)->where('ticket_id', '=', $ticketId)->limit(1);
+            $row = $stmt->build() ? $stmt->getAssoc() : [];
+
+            return !empty($row['slack_ts']) ? $row : null;
+        } catch (\Throwable $e) {
+            error_log("[TicketWebhook] thread lookup failed for ticket #{$ticketId}: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    private function thread_save(int $ticketId, string $ts, string $channel): void
+    {
+        if ($ts === '' || !$this->ensure_table())
+            return;
+
+        try {
+            $stmt = \WDB::select('ticket_id')->from(self::TABLE)->where('ticket_id', '=', $ticketId)->limit(1);
+
+            if ($stmt->build()) {
+                \WDB::update(self::TABLE, ['channel' => $channel, 'slack_ts' => $ts])
+                    ->where('ticket_id', '=', $ticketId)
+                    ->save();
+            } else {
+                \WDB::insert(self::TABLE, [
+                    'ticket_id' => $ticketId,
+                    'channel' => $channel,
+                    'slack_ts' => $ts,
+                    'cdate' => date('Y-m-d H:i:s'),
+                ]);
+            }
+        } catch (\Throwable $e) {
+            error_log("[TicketWebhook] could not save thread for ticket #{$ticketId}: " . $e->getMessage());
+        }
+    }
+
+    // ---------------------------------------------------------------- text helpers
 
     private function company(): string
     {
