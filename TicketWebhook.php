@@ -8,6 +8,10 @@ class TicketWebhook extends AddonModule
 {
     public string $version = '1.0';
 
+    // Admin links: the id is appended to the end.
+    private const CLIENT_URL = 'https://app.ogahost.com/ishquj/users/detail?id=';
+    private const TICKET_URL = 'https://app.ogahost.com/ishquj/tickets/detail?id=';
+
     private static array $sent = [];
 
     public function fields(): array
@@ -70,7 +74,8 @@ class TicketWebhook extends AddonModule
 
         $text = "New support ticket #{$id}" . ($source === 'staff' ? ' (opened by staff)' : '');
         if ($title !== '')  $text .= "\nTitle: {$title}";
-        if ($clientId > 0)  $text .= "\nClient ID: {$clientId}";
+        $text .= "\nTicket: " . self::TICKET_URL . $id;
+        if ($clientId > 0)  $text .= "\nClient: " . self::CLIENT_URL . $clientId;
         if ($body !== '')   $text .= "\nMessage: {$body}";
 
         $payload = json_encode(
